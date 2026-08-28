@@ -80,6 +80,13 @@ def subscriptions(user_id: Optional[int] = None) -> list[tuple]:
         return db.execute(query + " ORDER BY id DESC", args).fetchall()
 
 
+def subscription_statistics() -> tuple[int, list[tuple[str, int]]]:
+    with conn() as db:
+        total = db.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
+        by_source = db.execute("SELECT source_type, COUNT(*) FROM subscriptions GROUP BY source_type ORDER BY COUNT(*) DESC, source_type").fetchall()
+    return total, by_source
+
+
 def get_subscription(sub_id: int) -> Optional[tuple]:
     with conn() as db:
         return db.execute("SELECT id,user_id,name,url,source_type,last_hash,last_check,metadata_json FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
@@ -129,8 +136,27 @@ def menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [styled_button("Добавить игру", style="success", callback_data="add")],
         [InlineKeyboardButton("Мои подписки", callback_data="list"), InlineKeyboardButton("Проверить", callback_data="check")],
+        [InlineKeyboardButton("Статистика", callback_data="stats")],
         [InlineKeyboardButton("Справка", callback_data="help")],
     ])
+
+
+def statistics_text() -> str:
+    total, by_source = subscription_statistics()
+    source_names = {
+        "steam": "Steam",
+        "itch": "itch.io",
+        "epic": "Epic Games",
+        "rss": "RSS/Atom",
+        "web": "Веб-страницы",
+    }
+    lines = ["Статистика каталога", "", f"Всего игр: {total}"]
+    if by_source:
+        lines.append("")
+        lines.extend(f"{source_names.get(kind, kind)}: {count}" for kind, count in by_source)
+    else:
+        lines.extend(["", "Игры пока не добавлены."])
+    return "\n".join(lines)
 
 
 def sources_menu() -> InlineKeyboardMarkup:
@@ -540,6 +566,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.edit_message_text("Выполняется проверка.")
         changed = await check_user(update.effective_user.id, context.bot)
         await query.edit_message_text(f"Проверка завершена. Обновлений: {changed}.", reply_markup=menu())
+    elif data == "stats":
+        await query.edit_message_text(statistics_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="menu")]]))
     elif data.startswith("view:"):
         await show_card(query, int(data.split(":", 1)[1]), update.effective_user.id)
     elif data.startswith("delete:"):
