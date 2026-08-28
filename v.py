@@ -6,14 +6,14 @@ import logging
 import os
 import re
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 load_dotenv()
@@ -39,6 +39,7 @@ class GameInfo:
     requirements: str = "Не указаны"
     source_url: str = ""
     image_url: str = ""
+    image_urls: list[str] = field(default_factory=list)
 
 
 def now() -> str:
@@ -146,8 +147,91 @@ async def get_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 
 def clean(value: str, length: int = 800) -> str:
+    value = BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
     value = re.sub(r"\s+", " ", value).strip()
     return value if len(value) <= length else value[:length - 3] + "..."
+
+
+def first_text(soup: BeautifulSoup, selectors: tuple[str, ...]) -> str:
+    for selector in selectors:
+        element = soup.select_one(selector)
+        if element:
+            value = element.get("content") or element.get_text(" ", strip=True)
+            if value:
+                return clean(value)
+    return ""
+
+
+def json_ld_data(soup: BeautifulSoup) -> list[dict]:
+    result = []
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (TypeError, json.JSONDecodeError):
+            continue
+        items = data if isinstance(data, list) else data.get("@graph", []) if isinstance(data, dict) else []
+        if isinstance(data, dict) and not items:
+            items = [data]
+        result.extend(item for item in items if isinstance(item, dict))
+    return result
+
+
+def json_ld_value(data: list[dict], key: str) -> str:
+    for item in data:
+        value = item.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("url")
+        if isinstance(value, list):
+            value = ", ".join(str(x.get("name", x)) if isinstance(x, dict) else str(x) for x in value)
+        if value:
+            return clean(str(value))
+    return ""
+
+
+def table_value(soup: BeautifulSoup, label: str) -> str:
+    for row in soup.select(".game_info_panel_widget tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) >= 2 and cells[0].get_text(" ", strip=True).casefold() == label.casefold():
+            return clean(cells[1].get_text(" ", strip=True))
+    return ""
+
+
+def labeled_panel_value(soup: BeautifulSoup, labels: tuple[str, ...]) -> str:
+    wanted = {label.casefold() for label in labels}
+    for row in soup.select(".game_info_panel_widget tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) >= 2 and cells[0].get_text(" ", strip=True).casefold().rstrip(":") in wanted:
+            value = clean(cells[1].get_text(" ", strip=True))
+            if value:
+                return value
+    for label in soup.select(".game_info_panel_widget_label, .game_info_panel_widget .label"):
+        if label.get_text(" ", strip=True).casefold().rstrip(":") not in wanted:
+            continue
+        parent = label.parent
+        value = parent.get_text(" ", strip=True).replace(label.get_text(" ", strip=True), "", 1)
+        if value:
+            return clean(value)
+    return ""
+
+
+def format_release_date(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d.%m.%Y")
+    except ValueError:
+        return clean(value, 80)
+
+
+def image_urls(soup: BeautifulSoup, image_meta=None) -> list[str]:
+    urls = []
+    if image_meta and image_meta.get("content"):
+        urls.append(image_meta["content"])
+    for image in soup.select(".formatted_description img, .game_description img, .user_formatted img, .screenshot img, .screenshots img"):
+        url = image.get("src") or image.get("data-src")
+        if url and url.startswith(("http://", "https://")):
+            urls.append(url)
+    return list(dict.fromkeys(urls))[:10]
 
 
 def normalized_version(value: str) -> Optional[str]:
@@ -156,6 +240,26 @@ def normalized_version(value: str) -> Optional[str]:
     if not value or value.casefold() in {"не указана", "unknown", "n/a", "none", "-"}:
         return None
     return value.casefold()
+
+
+def extract_version(*values: str) -> Optional[str]:
+    """Ищет версию игры в заголовках, описании, devlog и RSS itch.io."""
+    patterns = (
+        r"\[(?:v|ver(?:sion)?|версия)\s*([0-9]+(?:[._-][0-9A-Za-z]+)*|[0-9]+[A-Za-z]+)\]",
+        r"\b(?:v|ver(?:sion)?|версия)\s*[:.]?\s*([0-9]+(?:[._-][0-9A-Za-z]+)*|[0-9]+[A-Za-z]+)\b",
+        r"\b(?:release|build|релиз|сборка)\s*[:.]?\s*v?\s*([0-9]+(?:[._-][0-9A-Za-z]+)*|[0-9]+[A-Za-z]+)\b",
+        r"(?<![A-Za-z0-9])v([0-9]+(?:[._-][0-9A-Za-z]+)*|[0-9]+[A-Za-z]+)\b",
+        r"\b(?:new|нов(?:ая|ый|ое))\s+([0-9]+(?:[._-][0-9A-Za-z]+)*|[0-9]+[A-Za-z]+)\s+(?:update|обновлени[ея])\b",
+    )
+    for value in values:
+        if not value:
+            continue
+        text = BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    return None
 
 
 async def steam(session: aiohttp.ClientSession, app_id: str) -> tuple[GameInfo, str]:
@@ -186,18 +290,43 @@ async def steam(session: aiohttp.ClientSession, app_id: str) -> tuple[GameInfo, 
 async def webpage(session: aiohttp.ClientSession, url: str, kind: str) -> tuple[GameInfo, str]:
     if not re.match(r"^https?://", url):
         raise ValueError("Ссылка должна начинаться с http:// или https://.")
-    raw = await get_url(session, f"{url.rstrip('/')}/devlog.rss" if kind == "itch" else url)
-    if not raw and kind == "itch":
-        raw = await get_url(session, url)
-    if not raw:
+    page_raw = await get_url(session, url)
+    if not page_raw:
         raise ValueError("Источник недоступен.")
-    soup = BeautifulSoup(raw, "html.parser")
-    title = soup.title.get_text(strip=True) if soup.title else url
-    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    soup = BeautifulSoup(page_raw, "html.parser")
+    structured = json_ld_data(soup)
+    title = first_text(soup, ('meta[property="og:title"]', 'h1', 'title')) or url
+    meta = soup.find("meta", attrs={"property": "og:description"}) or soup.find("meta", attrs={"name": "description"})
     image_meta = soup.find("meta", attrs={"property": "og:image"})
-    description = meta.get("content", "") if meta else soup.get_text(" ", strip=True)
-    version = re.search(r"(?:version|версия)\s*[:v]?\s*([\w.\-]+)", soup.get_text(" ", strip=True), re.I)
-    return GameInfo(title=clean(title, 120), description=clean(description), version=version.group(1) if version else "Не указана", source_url=url, image_url=image_meta.get("content", "") if image_meta else ""), raw
+    full_description = first_text(soup, (".formatted_description", ".game_description", ".user_formatted"))
+    description = (full_description if kind == "itch" else "") or (meta.get("content", "") if meta else "") or json_ld_value(structured, "description") or full_description
+    developer = json_ld_value(structured, "author") or labeled_panel_value(soup, ("author", "developer", "разработчик"))
+    publisher = json_ld_value(structured, "publisher") or labeled_panel_value(soup, ("publisher", "издатель"))
+    release_date = format_release_date(json_ld_value(structured, "datePublished"))
+    release_date = release_date or labeled_panel_value(soup, ("release date", "дата выхода", "released"))
+    genres = json_ld_value(structured, "genre") or labeled_panel_value(soup, ("genre", "genres", "жанр", "жанры"))
+    platforms = labeled_panel_value(soup, ("platform", "platforms", "платформа", "платформы"))
+    if not platforms:
+        platform_nodes = soup.select(".game_platform, .platforms a, .game_info_panel_widget .icon_label")
+        platforms = ", ".join(clean(node.get_text(" ", strip=True), 60) for node in platform_nodes if node.get_text(strip=True))
+    platforms = re.sub(r"\s+,", ",", platforms)
+    requirements = first_text(soup, (".requirements", ".game_info_panel_widget.requirements", ".system_requirements"))
+    if not requirements:
+        requirements = labeled_panel_value(soup, ("system requirements", "requirements", "системные требования"))
+    visible_text = soup.get_text(" ", strip=True)
+    rss = await get_url(session, f"{url.rstrip('/')}/devlog.rss") if kind == "itch" else ""
+    version = extract_version(title, description, visible_text, rss, page_raw)
+    content = page_raw + (rss or "")
+    pictures = image_urls(soup, image_meta)
+    return GameInfo(
+        title=clean(title, 120), description=clean(description) or "Нет описания.",
+        version=version or "Не указана", developer=developer or "Не указан",
+        publisher=publisher or "Не указан", release_date=release_date or "Не указана",
+        genres=genres or "Не указаны", platforms=platforms or "Не указаны",
+        requirements=requirements or "Не указаны", source_url=url,
+        image_url=image_meta.get("content", "") if image_meta else "",
+        image_urls=pictures,
+    ), content
 
 
 async def info_for(session: aiohttp.ClientSession, kind: str, source: str) -> tuple[GameInfo, str]:
@@ -229,24 +358,35 @@ def card_keyboard(info: GameInfo, sub_id: Optional[int] = None, can_delete: bool
     return InlineKeyboardMarkup(buttons)
 
 
+def pictures_for(info: GameInfo) -> list[str]:
+    return list(dict.fromkeys(info.image_urls or ([info.image_url] if info.image_url else [])))[:10]
+
+
+async def send_pictures(send_media, info: GameInfo, chat_id: Optional[int] = None) -> None:
+    pictures = pictures_for(info)
+    if not pictures:
+        return
+    try:
+        if len(pictures) == 1:
+            args = (chat_id, pictures[0]) if chat_id is not None else (pictures[0],)
+            await send_media(*args, caption=html.escape(clean(info.title, 200)), parse_mode="HTML")
+        else:
+            media = [InputMediaPhoto(media=url) for url in pictures]
+            await send_media(chat_id, media) if chat_id is not None else await send_media(media)
+    except Exception as error:
+        logger.warning("Could not send game images: %s", error)
+
+
 async def send_card(message, info: GameInfo, status: str, checked: str, keyboard: InlineKeyboardMarkup) -> None:
     text = card(info, status, checked)
-    if info.image_url:
-        try:
-            await message.reply_photo(info.image_url, caption=html.escape(clean(info.title, 200)), parse_mode="HTML")
-        except Exception as error:
-            logger.warning("Could not send card image: %s", error)
+    await send_pictures(message.reply_photo if len(pictures_for(info)) == 1 else message.reply_media_group, info)
     await message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
 
 
 async def send_notification(bot, chat_id: int, info: GameInfo, status: str) -> None:
     text = card(info, status, now())
     keyboard = card_keyboard(info)
-    if info.image_url:
-        try:
-            await bot.send_photo(chat_id, info.image_url, caption=html.escape(clean(info.title, 200)), parse_mode="HTML")
-        except Exception as error:
-            logger.warning("Could not send notification image: %s", error)
+    await send_pictures(bot.send_photo if len(pictures_for(info)) == 1 else bot.send_media_group, info, chat_id)
     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
 
 
