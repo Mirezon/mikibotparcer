@@ -8,6 +8,8 @@ import re
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from difflib import SequenceMatcher
+from urllib.parse import quote, unquote
 from typing import Optional
 
 import aiohttp
@@ -21,6 +23,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 DB_NAME = os.getenv("DB_NAME", "tracker.db")
 WAIT_SOURCE = 1
+WAIT_SEARCH = 2
+GAMES_PER_PAGE = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -408,14 +412,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Панель отслеживания обновлений", reply_markup=menu())
 
 
-async def show_list(query, user_id: int) -> None:
+async def show_list(query, user_id: int, page: int = 0, search: str = "") -> None:
     rows = subscriptions()
+    search = clean(search, 40)
+    if search:
+        needle = search.casefold()
+        ranked = [(SequenceMatcher(None, needle, row[2].casefold()).ratio(), row) for row in rows]
+        rows = [row for score, row in sorted(ranked, key=lambda item: (needle not in item[1][2].casefold(), -item[0])) if needle in row[2].casefold() or score > 0.25]
     if not rows:
-        await query.edit_message_text("Подписок пока нет.", reply_markup=menu())
+        text = "По вашему запросу ничего не найдено." if search else "Подписок пока нет."
+        await query.edit_message_text(text, reply_markup=menu())
         return
-    buttons = [[InlineKeyboardButton(clean(row[2], 45), callback_data=f"view:{row[0]}")] for row in rows]
+    pages = (len(rows) + GAMES_PER_PAGE - 1) // GAMES_PER_PAGE
+    page = max(0, min(page, pages - 1))
+    current = rows[page * GAMES_PER_PAGE:(page + 1) * GAMES_PER_PAGE]
+    buttons = [[InlineKeyboardButton(clean(row[2], 45), callback_data=f"view:{row[0]}")] for row in current]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("Назад", callback_data=f"list:{page - 1}:{quote(search, safe='')}"))
+    if page < pages - 1:
+        navigation.append(InlineKeyboardButton("Вперёд", callback_data=f"list:{page + 1}:{quote(search, safe='')}"))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([InlineKeyboardButton("Поиск", callback_data="search")])
+    if search:
+        buttons.append([InlineKeyboardButton("Сбросить поиск", callback_data="list")])
     buttons.append([InlineKeyboardButton("Главное меню", callback_data="menu")])
-    await query.edit_message_text("Общий каталог игр и источников.", reply_markup=InlineKeyboardMarkup(buttons))
+    caption = f"Общий каталог игр. Страница {page + 1}/{pages}."
+    if search:
+        caption += f" Запрос: {html.escape(search)}"
+    await query.edit_message_text(caption, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
 
 
 async def show_card(query, sub_id: int, user_id: int) -> None:
@@ -501,8 +527,15 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         prompts = {"steam": "Введите Steam AppID, например 730.", "epic": "Введите Epic slug или ссылку на игру.", "itch": "Введите ссылку на игру itch.io.", "rss": "Введите ссылку на RSS/Atom-ленту.", "web": "Введите ссылку на страницу."}
         await query.edit_message_text(prompts[kind], reply_markup=InlineKeyboardMarkup([[styled_button("Отмена", style="danger", callback_data="menu")]]))
         return WAIT_SOURCE
+    elif data == "search":
+        context.user_data["search_mode"] = True
+        await query.edit_message_text("Введите часть названия игры.", reply_markup=InlineKeyboardMarkup([[styled_button("Отмена", style="danger", callback_data="list")]]))
+        return WAIT_SEARCH
     elif data == "list":
         await show_list(query, update.effective_user.id)
+    elif data.startswith("list:"):
+        _, page, search = data.split(":", 2)
+        await show_list(query, update.effective_user.id, int(page), unquote(search))
     elif data == "check":
         await query.edit_message_text("Выполняется проверка.")
         changed = await check_user(update.effective_user.id, context.bot)
@@ -540,6 +573,23 @@ async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+async def receive_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    register_user(update.effective_user.id, update.effective_chat.id)
+    search = update.message.text.strip()
+    if not search:
+        await update.message.reply_text("Введите хотя бы одну букву.")
+        return WAIT_SEARCH
+    class SearchMessage:
+        def __init__(self, message):
+            self.message = message
+
+        async def edit_message_text(self, text, **kwargs):
+            await self.message.reply_text(text, **kwargs)
+
+    await show_list(SearchMessage(update.message), update.effective_user.id, search=search)
+    return ConversationHandler.END
+
+
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     changes = await check_all(context.bot)
     if not changes:
@@ -553,7 +603,7 @@ def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN в .env.")
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(callback, pattern=r"^(add|source:.*)$")], states={WAIT_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_source)]}, fallbacks=[CallbackQueryHandler(callback, pattern="^menu$")]))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(callback, pattern=r"^(add|source:.*|search)$")], states={WAIT_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_source)], WAIT_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search)]}, fallbacks=[CallbackQueryHandler(callback, pattern=r"^(menu|list)$")]))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", start))
     app.add_handler(CallbackQueryHandler(callback))
