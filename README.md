@@ -1,52 +1,37 @@
-# Telegram-бот: запуск и размещение на хостинге
+# Telegram-бот
 
-Проект запускается командой `python v.py`. Бот работает через Telegram Long Polling, поэтому для него не требуется домен, HTTPS или открытый входящий порт.
+Бот отслеживает изменения игровых страниц и сообщает об обновлениях в Telegram. Проект работает через Telegram Long Polling: для запуска не нужны домен, HTTPS и открытый входящий порт.
 
-## 1. Локальный запуск
+Репозиторий: https://github.com/Mirezon/mikibotparcer
 
-Требуется Python 3.11-3.13. Python 3.14 может работать, но для хостинга рекомендуется стабильная версия 3.12.
+## Установка на Ubuntu/Debian VPS
 
-В PowerShell из каталога проекта:
+Подключитесь к VPS по SSH и выполните команды ниже. У вас должны быть права `sudo`.
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-notepad .env
-python v.py
-```
-
-В `.env` укажите токен, полученный у `@BotFather`:
-
-```dotenv
-BOT_TOKEN=токен_бота_от_BotFather
-CHECK_INTERVAL_MINUTES=30
-DB_NAME=tracker.db
-```
-
-Остановить локальный запуск: `Ctrl+C`.
-
-## 2. Размещение на Linux VPS
-
-Ниже приведен вариант для Ubuntu/Debian с пользователем `bot` и каталогом `/opt/mikibotparcer`.
-
-### Подготовка сервера
-
-Подключитесь к серверу по SSH и выполните:
+### 1. Установить системные пакеты
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-sudo useradd --system --home /opt/mikibotparcer --shell /usr/sbin/nologin bot || true
-sudo mkdir -p /opt/mikibotparcer
-sudo chown -R "$USER":"$USER" /opt/mikibotparcer
+sudo apt install -y git python3 python3-venv python3-pip
 ```
 
-Загрузите в `/opt/mikibotparcer` файлы `v.py`, `requirements.txt`, `.env.example` и, если нужно сохранить существующие подписки, `tracker.db`. Это можно сделать через Git, SCP или SFTP. Не загружайте `.venv`, `__pycache__` и настоящий `.env` в публичный репозиторий.
+### 2. Скачать бота по ссылке с GitHub
 
-Из каталога проекта установите зависимости:
+```bash
+sudo mkdir -p /opt/mikibotparcer
+sudo chown "$USER":"$USER" /opt/mikibotparcer
+git clone https://github.com/Mirezon/mikibotparcer.git /opt/mikibotparcer
+cd /opt/mikibotparcer
+```
+
+Если каталог уже существует и бот ранее устанавливался, используйте обновление вместо `git clone`:
+
+```bash
+cd /opt/mikibotparcer
+git pull origin main
+```
+
+### 3. Создать виртуальное окружение и установить зависимости
 
 ```bash
 cd /opt/mikibotparcer
@@ -54,56 +39,90 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+### 4. Создать настройки бота
+
+```bash
 cp .env.example .env
 nano .env
 ```
 
-В `.env` укажите настоящий `BOT_TOKEN`. Затем назначьте владельца файлов:
+В `.env` укажите токен, который выдал `@BotFather`:
+
+```dotenv
+BOT_TOKEN=сюда_вставьте_токен_бота
+CHECK_INTERVAL_MINUTES=30
+DB_NAME=tracker.db
+```
+
+Сохранение в `nano`: `Ctrl+O`, `Enter`, затем выход: `Ctrl+X`.
+
+Настройте системного пользователя и права:
 
 ```bash
+sudo useradd --system --home /opt/mikibotparcer --shell /usr/sbin/nologin bot 2>/dev/null || true
 sudo chown -R bot:bot /opt/mikibotparcer
 sudo chmod 600 /opt/mikibotparcer/.env
 ```
 
-### Запуск как системный сервис
+### 5. Запустить в фоне через systemd
 
-В репозитории есть готовый файл `deploy/mikibot.service`. Установите его так:
+Готовый файл сервиса уже находится в репозитории. Установите его:
 
 ```bash
-sudo cp deploy/mikibot.service /etc/systemd/system/mikibot.service
+sudo cp /opt/mikibotparcer/deploy/mikibot.service /etc/systemd/system/mikibot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now mikibot
+```
+
+Проверить состояние:
+
+```bash
 sudo systemctl status mikibot
 ```
 
-После `enable --now` бот работает в фоне. SSH-консоль можно закрыть: `systemd` продолжит работу независимо от SSH-сессии и запустит бота снова после перезагрузки сервера.
+После `enable --now` SSH-консоль можно закрыть. Бот продолжит работать в фоне, запустится после перезагрузки VPS и автоматически перезапустится после ошибки.
 
-### Проверка и управление
+## Управление ботом
 
-Показать журнал в реальном времени:
+```bash
+sudo systemctl start mikibot
+sudo systemctl stop mikibot
+sudo systemctl restart mikibot
+sudo systemctl status mikibot
+```
+
+Просмотр журнала в реальном времени:
 
 ```bash
 sudo journalctl -u mikibot -f
 ```
 
-Основные команды:
-
-```bash
-sudo systemctl restart mikibot   # применить изменения к коду или .env
-sudo systemctl stop mikibot      # остановить
-sudo systemctl start mikibot     # запустить
-sudo systemctl status mikibot    # проверить состояние
-```
-
-Сервис настроен на автоматический перезапуск при ошибке. Если бот не запускается, сначала проверьте журнал и значение `BOT_TOKEN`:
+Последние 100 строк журнала:
 
 ```bash
 sudo journalctl -u mikibot -n 100 --no-pager
 ```
 
-## 3. Быстрый запуск без systemd
+## Обновление бота
 
-Для временного запуска на VPS можно использовать `tmux`:
+Перед обновлением сохраните базу данных. В ней хранятся подписки пользователей:
+
+```bash
+cd /opt/mikibotparcer
+sudo cp tracker.db "tracker.db.backup-$(date +%F-%H%M)"
+git pull origin main
+sudo /opt/mikibotparcer/.venv/bin/python -m pip install -r requirements.txt
+sudo systemctl restart mikibot
+sudo systemctl status mikibot
+```
+
+Не удаляйте `tracker.db`, если нужно сохранить подписки.
+
+## Быстрый временный запуск через tmux
+
+Этот способ оставляет процесс работать после закрытия SSH, но не запускает его автоматически после перезагрузки сервера:
 
 ```bash
 sudo apt install -y tmux
@@ -113,32 +132,35 @@ tmux new -s mikibot
 python v.py
 ```
 
-Нажмите `Ctrl+B`, затем `D`, чтобы отсоединиться от сессии. Бот останется работать после закрытия SSH. Вернуться к журналу можно командой:
+Отсоединиться, не останавливая бота: нажмите `Ctrl+B`, затем `D`.
+
+Вернуться в сессию:
 
 ```bash
 tmux attach -t mikibot
 ```
 
-Для постоянной эксплуатации используйте `systemd`: `tmux` не заменяет автозапуск после перезагрузки.
+Для постоянной работы используйте `systemd`.
 
-## 4. Обновление бота
+## Локальный запуск в Windows
 
-Сделайте резервную копию базы, обновите файлы и перезапустите сервис:
+В PowerShell из каталога проекта:
 
-```bash
-cd /opt/mikibotparcer
-sudo cp tracker.db tracker.db.backup-$(date +%F-%H%M)
-# загрузить новые v.py и requirements.txt
-sudo -u bot /opt/mikibotparcer/.venv/bin/python -m pip install -r requirements.txt
-sudo systemctl restart mikibot
-sudo systemctl status mikibot
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env
+python v.py
 ```
 
-`tracker.db` содержит подписки пользователей. Не удаляйте его при обновлении, если хотите сохранить данные.
+Остановить бота: `Ctrl+C`.
 
-## Важные ограничения
+## Важно
 
-- Не запускайте два экземпляра этого бота одновременно: Telegram не позволит двум polling-процессам получать одни и те же обновления.
-- Храните `.env` в секрете. Если токен стал доступен другим, перевыпустите его через `@BotFather`.
-- Для polling не нужно открывать порт на сервере. Серверу нужен исходящий доступ в интернет к Telegram и к сайтам-источникам.
-- Если провайдер хостинга останавливает бесплатные или спящие приложения, выберите VPS или тариф с постоянным процессом.
+- Не публикуйте файл `.env`: в нем находится секретный токен Telegram.
+- Не запускайте два экземпляра бота одновременно, иначе Telegram будет переключать обновления между процессами.
+- `tracker.db` игнорируется Git и остается только на сервере.
+- VPS должен иметь исходящий доступ в интернет к Telegram и сайтам-источникам.
+- Бесплатный хостинг может останавливать фоновые процессы. Для постоянной работы нужен VPS или тариф без остановки приложений.
