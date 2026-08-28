@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram game tracker bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/mikibotparcer
+EnvironmentFile=/opt/mikibotparcer/.env
+ExecStart=/opt/mikibotparcer/.venv/bin/python /opt/mikibotparcer/v.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
